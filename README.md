@@ -12,11 +12,7 @@ GitHub page: https://dianaaleksieieva.github.io/population_growth/
 ### 1. Data Cleaning & Feature Engineering
 
 Processed World Bank population and demographic datasets
-Computed instantaneous growth rate:
-
-$$
-r_t = \ln\left(\frac{N_{t+1}}{N_t}\right)
-$$
+Computed instantaneous growth rate
 
 Encoded region and income groups as categorical features
 Constructed model matrices with interaction terms
