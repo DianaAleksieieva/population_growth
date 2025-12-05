@@ -14,7 +14,9 @@ GitHub page: https://dianaaleksieieva.github.io/population_growth/
 Processed World Bank population and demographic datasets
 Computed instantaneous growth rate:
 
-\( r_t = \ln\left(\frac{N_{t+1}}{N_t}\right) \)
+$$
+r_t = \ln\left(\frac{N_{t+1}}{N_t}\right)
+$$
 
 Encoded region and income groups as categorical features
 Constructed model matrices with interaction terms
@@ -65,16 +67,6 @@ Horizon	MAPE	MALPE (Bias)
 10 years	6.14%	2.08
 
 The model achieves excellent short-term accuracy and stable long-term behavior.
-
-## 📁 Repository Structure
-population_project/
-│
-├── Data-preprocessing.qmd        # Data cleaning & preparation
-├── population_modeling.qmd       # Modeling, evaluation, forecasting
-├── _quarto.yml                   # Quarto website configuration
-├── _site/                        # Rendered website files (for GitHub Pages)
-├── data/                         # Clean & raw datasets (if included)
-└── README.md                     # Project documentation
 
 ## 🛠️ Technologies Used
 
