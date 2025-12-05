@@ -1,0 +1,919 @@
+---
+title: "Population Growth by Region"
+author: "Diana Aleksieieva"
+date: "2025-12-05"
+format:
+  html:
+    theme: cosmo
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.width = 7,      
+  fig.height = 5,    
+  out.width = "100%", 
+  fig.align = "center",
+  dpi = 300          
+)
+```
+# Part II Modeling & Evaluation
+
+## Introduction
+
+The goal of this project is to analyze global population dynamics using data from the World Bank and UN, we examine how birth rates, death rates, 
+migration flows, income groups, and regional characteristics to predict population growth across countries.
+
+To measure yearly population growth, we compute the **instantaneous growth rate**, 
+defined as:
+
+$$
+r_t = \ln\left(\frac{N_{t+1}}{N_t}\right)
+$$
+
+where \(N_t\) represents the population in year \(t\).  
+We then model this growth rate as a function of variables:
+
+$$
+r_t = \beta_0 + 
+      \beta_1 B_t +
+      \beta_2 D_t +
+      \beta_3 M_t +
+      \beta_4 IG_t +
+      \beta_5 R_t +
+      \epsilon_t
+$$
+
+This approach allows us to understand birth and death rates, net migration, income level, and region population trends, 
+and to explore differences in demographic patterns across countries and development groups.
+
+```{r echo=FALSE, message=FALSE, include=FALSE}
+## Libraries
+library(tidyverse)       
+library(readr)          
+library(lubridate)       
+library(countrycode)    
+library(janitor)         
+library(fastDummies)     
+library(scales)          
+library(broom)          
+library(ggthemes)        
+library(knitr)          
+library(kableExtra)      
+library(leaps)
+library(MASS)
+library(glmnet)
+library(patchwork)
+```
+
+
+```{r include=FALSE}
+world_pop_full <- read_csv("data/output/world_population_full_clean.csv",
+                           show_col_types = FALSE)
+
+# Compute Growth Rate
+world_pop_full <- world_pop_full %>%
+  group_by(`Country Code`) %>%
+  arrange(Year, .by_group = TRUE) %>%
+  mutate(
+    r_t = log(lead(Population) / Population)   
+  ) %>%
+  ungroup()
+
+world_pop_full <- world_pop_full %>%
+  mutate(
+    # Clean IncomeGroup
+    IncomeGroup = gsub(" ", "_", IncomeGroup),
+    IncomeGroup = gsub("[^A-Za-z0-9_]", "_", IncomeGroup),
+
+    # Clean Region
+    Region = gsub(" ", "_", Region),
+    Region = gsub("[^A-Za-z0-9_]", "_", Region),
+    Region = gsub("___", "_", Region),
+    Region = gsub("__", "_", Region)
+  ) %>%
+  mutate(
+    IncomeGroup = factor(IncomeGroup),
+    Region      = factor(Region)
+  )
+
+world_pop_full_clean <- world_pop_full %>%
+  drop_na(r_t, BirthRate, DeathRate, NetMigration, IncomeGroup, Region)
+```
+
+```{r echo=FALSE, include=FALSE}
+head(world_pop_full_clean,3)
+```
+## Basic Linear Model
+
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+model_basic <- lm(
+  r_t ~ BirthRate + DeathRate + NetMigration + IncomeGroup + Region,
+  data = world_pop_full_clean
+)
+
+summary(model_basic)
+```
+
+The model demonstrates a good overall fit for demographic data. The R-squared value of 0.423 indicates that the model explains about 42% of the variation in population growth rates across countries. The Residual Standard Error (RSE = 0.0138) are small that indicates that the model’s predictions are reasonably accurate and that errors remain well within expected ranges for noisy macro-level population data.
+
+Finally, the model’s F-statistic (830.5, p < 2e-16) indicates that the set of predictors—birth rate, death rate, migration, income group, and region—collectively provide significant explanatory power. Together, these metrics indicate that the model performs well for global demographic analysis.
+
+```{r, echo=FALSE, fig.width=12, fig.height=10}
+pred_test <- predict(model_basic, newdata = world_pop_full_clean)
+Residuals_test <- world_pop_full_clean$r_t - pred_test
+Region_test <- world_pop_full_clean$Region
+
+df_resid2 <- data.frame(
+Predicted = pred_test,
+Residuals = Residuals_test,
+Region = Region_test
+)
+
+ggplot(df_resid2, aes(x = Predicted, y = Residuals)) +
+geom_point(alpha = 0.4, size = 1.2, color = "steelblue") +
+geom_hline(yintercept = 0, color = "red", linewidth = 0.8) +
+facet_wrap(~ Region, scales = "free") +
+theme_minimal(base_size = 12) +
+labs(
+title = "Residuals vs Predicted Values (Basic Model)",
+x = "Predicted r_t",
+y = "Residuals"
+)
+```
+
+The residual prediction plots for the baseline model show nonlinear clusters and diagonal patterns in several regions (e.g., North America and Europe & Central Asia). This indicates that trends are not fully captured. While the model reflects the overall direction of growth, the relationship between the predictors and actual outcomes varies considerably across regions, leaving substantial unexplained variability.
+
+```{r echo=FALSE}
+# Boxplot of residuals by region (reusing df_resid2)
+ggplot(df_resid2, aes(x = Region, y = Residuals, fill = Region)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Distribution of Residuals by Region (Basic Model)",
+    x = "",
+    y = "Residual (Actual – Predicted)"
+  )
+```
+In the basic model, the distribution of residuals across regions is centered close to zero. However, several regions such as East Asia & Pacific, Latin America & Caribbean, and Sub-Saharan Africa show wider residual spreads and more extreme outliers. This indicates that the linear specification may not fully capture underlying regional dynamics. 
+
+## Extended Linear Model with Interaction Terms
+To allow the effect of demographic variables to vary across economic and geographical groups, we estimate an extended model that includes interaction terms between birth rates, death rates, migration rates, and the categorical variables *Income Group* and *Region*:
+
+$$
+r_t =
+\beta_0 +
+\beta_1 B_t +
+\beta_2 D_t +
+\beta_3 M_t +
+\beta_4 IG_t +
+\beta_5 R_t +
+\beta_6 (B_t \times IG_t) +
+\beta_7 (D_t \times IG_t) +
+\beta_8 (M_t \times IG_t) +
+\beta_9 (B_t \times R_t) +
+\beta_{10} (D_t \times R_t) +
+\beta_{11} (M_t \times R_t) +
+\epsilon_t
+$$
+
+This extended specification allows the slopes of the demographic variables to differ by income level and region.  
+
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+model_extended <- lm(
+  r_t ~ BirthRate * IncomeGroup +
+        DeathRate * IncomeGroup +
+        NetMigration * IncomeGroup +
+        BirthRate * Region +
+        DeathRate * Region +
+        NetMigration * Region,
+  data = world_pop_full_clean
+)
+
+summary(model_extended)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+
+model_compare <- data.frame(
+  Model = c("Basic", "Ext"),
+  RSE = c(0.01377, 0.01325),
+  R2 = c(0.4231, 0.4674),
+  AdjR2 = c(0.4226, 0.4659),
+  Fstat = c(830.5, 305.2),
+  P = c(12, 39),
+  DF = c(13589, 13562)
+)
+knitr::kable(model_compare, format = "pandoc", digits = 4)
+```
+
+Compared to the basic model, the extended model improves fit (R² increases from 0.423 to 0.467) and reduces prediction error slightly - from 0.01377 to 0.01325. 
+
+```{r, echo=FALSE, fig.height=6}
+# Extract coefficients
+coef_df <- tidy(model_extended) %>%
+  filter(term != "(Intercept)") %>%         # remove intercept
+  mutate(
+    abs_est = abs(estimate),
+    direction = ifelse(estimate > 0, "Positive", "Negative")
+  ) %>%
+  arrange(desc(abs_est)) %>%                # sort by magnitude
+  slice(1:30)                                # optional: top 30 largest effects for readability
+                                            # remove slice() to show all
+
+# Plot
+ggplot(coef_df, aes(x = reorder(term, abs_est), y = estimate, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Positive" = "#1f77b4", "Negative" = "#d62728")) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Effect Size of Predictors in the Extended Model",
+    x = "Predictor",
+    y = "Coefficient Estimate",
+    fill = "Effect Direction"
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 10)
+  )
+```
+## Subset Selection
+
+```{r, echo=FALSE, warning=FALSE}
+X <- model.matrix(
+  r_t ~ BirthRate * IncomeGroup +
+        DeathRate * IncomeGroup +
+        NetMigration * IncomeGroup +
+        BirthRate * Region +
+        DeathRate * Region +
+        NetMigration * Region,
+  data = world_pop_full_clean
+)
+y <- world_pop_full_clean$r_t
+
+clean_name <- function(x) gsub(":", "_x_", x, fixed = TRUE)
+colnames(X) <- clean_name(colnames(X))
+y <- world_pop_full_clean$r_t
+# Subset selection
+best_subset <- regsubsets(
+  x = X[, -1],   # remove intercept
+  y = y,
+  nvmax = 40
+)
+
+subset_summary <- summary(best_subset)
+```
+
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+subset_summary$cp
+subset_summary$bic
+subset_summary$adjr2
+```
+```{r, echo=FALSE, warning=FALSE}
+best_cp   <- which.min(subset_summary$cp)
+best_bic  <- which.min(subset_summary$bic)
+best_adjr <- which.max(subset_summary$adjr2)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+#Plots 
+par(mfrow = c(1, 3))       
+num_models <- length(subset_summary$cp)
+
+# Cp Plot 
+plot(subset_summary$cp, type = "b",
+     xlab = "Number of predictors", ylab = "Cp",
+     main = "Cp Selection")
+points(best_cp, subset_summary$cp[best_cp], col = "red", pch = 19, cex = 1.4)
+text(best_cp, subset_summary$cp[best_cp], labels = best_cp,
+     pos = 3, col = "red")
+
+# BIC Plot
+plot(subset_summary$bic, type = "b",
+     xlab = "Number of predictors", ylab = "BIC",
+     main = "BIC Selection")
+points(best_bic, subset_summary$bic[best_bic], col = "blue", pch = 19, cex = 1.4)
+text(best_bic, subset_summary$bic[best_bic], labels = best_bic,
+     pos = 3, col = "blue")
+
+# Adjusted R² Plot
+plot(subset_summary$adjr2, type = "b",
+     xlab = "Number of predictors", ylab = "Adjusted R²",
+     main = "Adjusted R² Selection")
+points(best_adjr, subset_summary$adjr2[best_adjr], col = "darkgreen", pch = 19, cex = 1.4)
+text(best_adjr, subset_summary$adjr2[best_adjr], labels = best_adjr,
+     pos = 3, col = "darkgreen")
+
+par(mfrow = c(1, 1))       
+
+```
+This plot summarizes the results of best-subset model selection using three criteria: Cp, BIC, and Adjusted R². All three metrics show improvements as predictors are added, but they level off around 25–30 variables. For next steps I choose the BIC-selected model with 25 predictors for further analysis and forecasting.
+
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+forward_fit <- regsubsets(
+  x = X[, -1],
+  y = y,
+  nvmax = 40,
+  method = "forward"
+)
+backward_fit <- regsubsets(
+  x = X[, -1],
+  y = y,
+  nvmax = 40,
+  method = "backward"
+)
+```
+
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+coef(best_subset, best_bic)
+```
+
+### Build the final confirmed model
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+selected_vars <- names(coef(best_subset, best_bic))[-1]   # drop intercept
+
+# Create the model.matrix version of X_reduced (no intercept)
+X_reduced <- X[, selected_vars, drop = FALSE]
+
+# Fit reduced model 
+model_reduced <- lm(y ~ ., data = as.data.frame(X_reduced))
+
+summary(model_reduced)
+
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.height=6}
+# Extract coefficients from reduced model
+coef_df_reduced <- tidy(model_reduced) %>%
+  filter(term != "(Intercept)") %>%          # remove intercept
+  mutate(
+    abs_est = abs(estimate),
+    direction = ifelse(estimate > 0, "Positive", "Negative")
+  ) %>%
+  arrange(desc(abs_est))                      # sort by effect size
+
+# Plot
+ggplot(coef_df_reduced, aes(x = reorder(term, abs_est), y = estimate, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Positive" = "#1f77b4",
+    "Negative" = "#d62728"
+  )) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Effect Size of Predictors in the Reduced Model",
+    x = "Predictor",
+    y = "Coefficient Estimate",
+    fill = "Effect Direction"
+  ) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+```{r, echo=FALSE, warning=FALSE}
+# Round AIC values for readability
+AIC_basic    <- round(AIC(model_basic), 1)
+AIC_extended <- round(AIC(model_extended), 1)
+AIC_reduced  <- round(AIC(model_reduced), 1)
+
+model_compare <- data.frame(
+  Model = c("Basic", "Extended", "Reduced"),
+  RSE   = c(0.01377, 0.01325, 0.01325),
+  R2    = c(0.4231, 0.4674, 0.4668),
+  AdjR2 = c(0.4226, 0.4659, 0.4658),
+  AIC   = c(AIC_basic, AIC_extended, AIC_reduced),
+  Pred  = c(12, 39, 25),
+  DF    = c(13589, 13562, 13576)
+)
+
+cat("\\small\n")
+
+knitr::kable(
+  model_compare,
+  format = "pandoc",
+  digits = 4,
+  align = c("l", "c", "c", "c", "c", "c", "c")
+)
+
+cat("\\normalsize\n")
+```
+The reduced model maintains nearly the same R² performance as the full extended model (0.4668 vs 0.4674), but reduced model using 14 fewer predictors. Its residual standard error is identical to the extended model. 
+
+For better visualization and interpretation, I transform the raw AIC values into an AIC improvement score, defined as the reduction in AIC relative to the basic model:
+$$
+\text{AIC}_{\text{improvement}} = \text{AIC}_{\text{basic}} - \text{AIC}
+$$
+
+This transformation ensures that the best-performing model has the highest value, making the barplot more intuitive (higher = better). 
+
+```{r, echo=FALSE, fig.width=12}
+# R-squared data 
+df_rsquared <- model_compare %>%
+  dplyr::select(Model, R2)
+
+df_rsquared$Model <- factor(
+  df_rsquared$Model,
+  levels = c("Basic", "Extended", "Reduced")
+)
+
+# AIC improvement data
+df_aic <- model_compare %>%
+  dplyr::select(Model, AIC) %>%
+  mutate(AIC_norm = (max(AIC) - AIC) / (max(AIC) - min(AIC)))
+
+# R-squared plot
+p1 <- ggplot(df_rsquared, aes(x = Model, y = R2, fill = Model)) +
+  geom_col(width = 0.65) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "R-squared Comparison (Higher = Better)",
+    x = "",
+    y = "R-squared"
+  )
+
+# AIC plot (lower = better)
+p2 <- ggplot(df_aic, aes(x = Model, y = AIC, fill = Model)) +
+  geom_col(width = 0.65) +
+  scale_y_reverse() +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "AIC (Lower is Better, Axis Reversed)",
+    x = "",
+    y = "AIC (reversed)"
+  )
+
+# Side-by-side 
+p1 + p2
+```
+
+
+## Train/test split 
+Before using the model for forecasting, it is important to check whether it actually generalizes beyond the data it was trained on. Because the model was built using many interaction terms and subset selection based on the full dataset, there is a real risk of overfitting—performing well on the training data but poorly on unseen years or countries.
+To make sure the model’s predictions are reliable and not just capturing noise, I evaluated it on a separate test set and computed its prediction error.
+
+```{r, echo=FALSE, warning=FALSE}
+cutoff_year <- 2005
+years <- world_pop_full_clean$Year
+
+train_idx <- which(years <= cutoff_year)
+test_idx  <- which(years >  cutoff_year)
+
+X_train <- X_reduced[train_idx, , drop = FALSE]
+X_test  <- X_reduced[test_idx,  , drop = FALSE]
+
+y_train <- y[train_idx]
+y_test  <- y[test_idx]
+
+model_reduced_train <- lm(y_train ~ ., data = as.data.frame(X_train))
+
+pred_test <- predict(model_reduced_train, newdata = as.data.frame(X_test))
+```
+
+```{r, echo=FALSE, warning=FALSE}
+test_mse <- mean((y_test - pred_test)^2)
+test_mae <- mean(abs(y_test - pred_test))
+
+# R² for test set
+ss_total <- sum((y_test - mean(y_test))^2)
+ss_res   <- sum((y_test - pred_test)^2)
+test_r2  <- 1 - ss_res/ss_total
+
+test_mse
+test_mae
+test_r2
+```
+
+
+```{r, echo=FALSE, fig.width=12, fig.height=10}
+df_clean <- world_pop_full_clean
+df_clean$Region <- factor(df_clean$Region)
+
+Region_test <- df_clean$Region[test_idx]
+Actual_test <- y_test
+Pred_test   <- pred_test
+
+df_plot <- data.frame(
+  Actual = Actual_test,
+  Pred   = Pred_test,
+  Region = Region_test
+)
+
+ggplot(df_plot, aes(x = Actual, y = Pred)) +
+  geom_point(alpha = 0.5, size = 1.3) +
+  facet_wrap(~ Region, scales = "free") +
+  geom_abline(slope = 1, intercept = 0, color = "red", lwd = 1) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Predicted vs Actual Growth Rates by Region",
+    x = "Actual r_t",
+    y = "Predicted r_t"
+  )
+```
+
+The predicted vs actual scatterplots demonstrates that the reduced model generalizes well to unseen years. The model accurately predicting population growth rates for most observations within different regions.
+
+
+```{r, echo=FALSE}
+Residuals_test <- y_test - pred_test
+
+df_resid <- data.frame(
+  Residuals = Residuals_test,
+  Region    = Region_test
+)
+
+ggplot(df_resid, aes(x = Region, y = Residuals, fill = Region)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(
+    title = "Distribution of Residuals by Region",
+    x = "",
+    y = "Residual (Actual – Predicted)"
+  )
+```
+Compared to the baseline model, the reduced model produces tighter residual spreads for many regions, suggesting less noise and more efficient estimates. However, a few regions still show more outliers, likely reflecting country-specific shocks or other local drivers that are not captured even by this dataset. The overall error patterns highlight that regions such as the Middle East & North Africa and Sub-Saharan Africa have wider residual distributions and occasional large deviations. This reflects more volatile or uneven population growth that a linear model struggles to capture. In contrast, regions like Europe and North America display much smaller residual dispersions, indicating more stable and predictable demographic trends that the reduced model can represent more consistently.
+
+```{r, echo=FALSE, fig.width=12, fig.height=10}
+df_resid2 <- data.frame(
+  Predicted = pred_test,
+  Residuals = Residuals_test,
+  Region    = Region_test
+)
+
+ggplot(df_resid2, aes(x = Predicted, y = Residuals)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  facet_wrap(~ Region, scales = "free") +
+  geom_hline(yintercept = 0, color = "red", lwd = 1) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Residuals vs Predicted Values by Region",
+    x = "Predicted r_t",
+    y = "Residuals"
+  )
+```
+
+Residuals are approximately centered around zero and display no structural pattern, suggesting the model form is good. 
+
+## Projected Forecast
+
+In this part of the project, we extend our analysis from explaining population growth to forecasting future population sizes. We select a base year and use our regression model to predict each country’s future growth rate over a chosen forecast horizon. 
+
+Forecast horizon: the interval between the base year and target year:
+$$
+h = t_f - t_b
+$$
+Regression equations with time-shift by ℎ: 
+$$
+\hat r_{t+h}
+= \beta_0
++ \beta_1 B_{t_b}
++ \beta_2 D_{t_b}
++ \beta_3 M_{t_b}
++ \beta_4 IG_{t_b}
++ \beta_5 R
+$$
+
+$$
+N_{t+h} = N_{t_b} \cdot e^{\hat r_{t+h}}
+$$
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+world_pop_full_clean$row_id <- seq_len(nrow(world_pop_full_clean))
+
+last_rows <- world_pop_full_clean %>%
+  group_by(`Country or Territory`) %>%  
+  filter(Year == max(Year)) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+population <- world_pop_full_clean$Population
+Year       <- world_pop_full_clean$Year
+
+forecast_country_multi <- function(row_id, model, X_df, population, Year, max_h = 10) {
+
+  newdata <- as.data.frame(X_df[row_id, , drop = FALSE])
+  r_hat   <- as.numeric(predict(model, newdata))
+
+  N_t    <- population[row_id]
+  Year_t <- Year[row_id]
+
+  horizons <- 1:max_h
+
+  data.frame(
+    Country     = world_pop_full_clean$`Country or Territory`[row_id],
+    Region      = world_pop_full_clean$Region[row_id],
+    IncomeGroup = world_pop_full_clean$IncomeGroup[row_id],
+
+    Year_base   = Year_t,
+    Year        = Year_t + horizons,        
+    horizon     = horizons,
+
+    r_hat       = r_hat,
+    N_base      = N_t,
+    N_forecast <- N_t * exp(r_hat * horizons),
+    Population_millions = (N_t * exp(r_hat * horizons)) / 1e6,
+    point       = "forecast"
+  )
+}
+
+future_proj_multi <- do.call(
+  rbind,
+  lapply(last_rows$row_id, function(idx) {
+    forecast_country_multi(idx, model_reduced, X_reduced, population, Year, max_h = 20)
+  })
+)
+
+```
+
+
+```{r, echo=FALSE, warning=FALSE}
+region_forecast_multi <- future_proj_multi %>%
+  group_by(Region, Year) %>%
+  summarise(
+    Population_millions = sum(Population_millions),
+    horizon = max(horizon),
+    .groups = "drop"
+  ) %>%
+  mutate(point = "forecast")
+```
+
+```{r, fig.width=12, fig.height=14, echo=FALSE, warning=FALSE}
+## Historical data
+region_history <- world_pop_full_clean %>%
+  group_by(Region, Year) %>%
+  summarise(
+    Population_millions = sum(Population) / 1e6,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    point = "historical",
+    horizon = 10
+  ) %>%
+  dplyr::select(Region, horizon, Year, Population_millions, point)
+
+
+# Forecast 10 years
+future_proj_multi <- do.call(
+  rbind,
+  lapply(last_rows$row_id, function(idx) {
+    forecast_country_multi(
+      row_id    = idx,
+      model     = model_reduced,
+      X_df      = X_reduced,
+      population = population,
+      Year      = Year,
+      max_h     = 10
+    )
+  })
+)
+
+# Aggregate forecast by region
+region_forecast_multi <- future_proj_multi %>%
+  group_by(Region, Year) %>%
+  summarise(
+    Population_millions = sum(Population_millions),
+    horizon = max(horizon), 
+    .groups = "drop"
+  ) %>%
+  mutate(point = "forecast") %>%
+  dplyr::select(Region, horizon, Year, Population_millions, point)
+
+
+# Combine historical and forecast
+plot_region_full <- rbind(region_history, region_forecast_multi)
+
+cutoff_year <- max(world_pop_full_clean$Year)
+
+# Plot 
+ggplot(plot_region_full,
+       aes(x = Year,
+           y = Population_millions,
+           color = Region,
+           group = Region)) +
+  
+  # Historical line
+  geom_line(data = plot_region_full %>% filter(point == "historical"),
+            linewidth = 1, alpha = 0.8) +
+  
+  # Forecast lines (dashed)
+  geom_line(data = plot_region_full %>% filter(point != "historical"),
+            linewidth = 1.4, linetype = "dashed", alpha = 0.9) +
+  
+  # Vertical line separating data
+  geom_vline(xintercept = cutoff_year,
+             linetype = "dotted",
+             color = "black",
+             linewidth = 1) +
+  
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Regional Population: Historical and 10-Year Forecast",
+    subtitle = "Solid = historical, dashed = multi-step model forecast (1–10 years)",
+    x = "Year",
+    y = "Population (millions)",
+    color = "Region"
+  ) +
+  scale_color_brewer(palette = "Dark2")
+
+
+```
+
+The plot shows historical population trends for each global region from 1960 to 2022, followed by a 10-year forecast based on  regression-based growth model. 
+
+Sub-Saharan Africa shows one of the strongest projected increases. Middle East & North Africa displays the sharpest projected rise. This results from the model assigning relatively high growth rates to this region due to a combination of above-average birth rates, positive region effects, and large positive migration interactions. As a result, forecasted population increases much faster than Europe or North America. 
+
+# Part III Rolling Window Cross-Validation
+
+## Method Overview
+
+We estimate a population-growth forecasting model using the predictor variables  
+$B_{t_b}$, $D_{t_b}$, $M_{t_b}$, $IG_{t_b}$, and region $R$.  
+The target variable is the future growth rate $r_{t_f}$.
+
+All model training uses only historical data; future validation years are held out. For each forecast horizon $h$, the model is trained using a rolling time window. After each step, the window is moved forward to ensure that each prediction mimics a real out-of-sample forecast.
+
+The predicted future growth rate $r_{t_f}$ is converted to a future population using the baseline population $N_{t_b}$:
+
+$$
+N_{t_f} = N_{t_b}\,(1 + r_{t_f})
+$$
+
+## Rolling Window Forecasting
+
+Let the initial training window cover the years from $t_1$ to $t_b$.  
+After fitting the model on this window, we generate a forecast for the year
+
+$$
+t_f = t_b + h,
+$$
+
+where $h \in \{1, 5, 10\}$ is the forecast horizon.
+
+The window is then advanced one step forward:
+
+$$
+(t_1,\, t_b) \;\rightarrow\; (t_2,\, t_b + 1)
+$$
+
+and the model is refit.  
+Repeating this procedure produces many forecasts for each horizon, which allows a consistent evaluation of accuracy.
+
+## Forecast Error Measures
+
+For each forecast, the percent error is defined as:
+
+$$
+PE_t = \left(\frac{F_t - N_t}{N_t}\right) \times 100,
+$$
+
+where  
+- $F_t$ = forecasted population  
+- $N_t$ = actual population  
+- $PE_t$ = percent error for year $t$
+
+## Precision: Mean Absolute Percent Error (MAPE)
+
+MAPE measures the average magnitude of forecast error, ignoring direction:
+
+$$
+\text{MAPE} = \frac{1}{n} \sum_{t=1}^{n} |PE_t|.
+$$
+
+## Bias: Mean Algebraic Percent Error (MALPE)
+
+MALPE preserves the sign of the error, indicating whether the model tends to over- or under-predict:
+
+$$
+\text{MALPE} = \frac{1}{n} \sum_{t=1}^{n} PE_t.
+$$
+
+Interpretation:
+
+- **Negative MALPE:** model tends to underpredict  
+- **Positive MALPE:** model tends to overpredict  
+
+These evaluation metrics follow the methodology in Rayer (2008), *Population Forecast Errors: A Primer for Planners*.
+
+
+```{r, echo=FALSE, warning=FALSE , message=FALSE, include=FALSE}
+# Rolling Window Forecast Error
+
+compute_mape_malpe <- function(df, X, model_vars,
+                               horizons = c(1,5,10),
+                               window_size = 20) {
+  
+  results <- data.frame(horizon = numeric(),
+                        MAPE = numeric(),
+                        MALPE = numeric())
+  
+  df <- df %>% arrange(`Country Code`, Year)
+  
+  country_list <- unique(df$`Country Code`)
+  
+  for (h in horizons) {
+    
+    errors_all <- c()
+    
+    for (cc in country_list) {
+      
+      df_c <- df %>% filter(`Country Code` == cc)
+      
+      # Require at least (window_size + h) years
+      if (nrow(df_c) < window_size + h) next
+      
+      X_c <- X[df$`Country Code` == cc, model_vars, drop = FALSE]
+      y_c <- df_c$r_t
+      pop <- df_c$Population
+      
+      n_c <- nrow(df_c)
+      
+      # Rolling windows inside each country
+      for (start_idx in 1:(n_c - window_size - h + 1)) {
+        
+        train_idx <- start_idx:(start_idx + window_size - 1)
+        base_idx  <- start_idx + window_size - 1
+        target_idx <- base_idx + h
+        
+        X_train <- X_c[train_idx, , drop = FALSE]
+        y_train <- y_c[train_idx]
+        X_base  <- as.data.frame(X_c[base_idx, , drop = FALSE])
+        
+        N_base <- pop[base_idx]
+        N_true <- pop[target_idx]
+        
+        # Fit model
+        fit <- try(lm(y_train ~ ., data = as.data.frame(X_train)), silent = TRUE)
+        if (inherits(fit, "try-error")) next
+        
+        N_pred <- N_base
+        cur_X  <- X_base
+        
+        for (step in 1:h) {
+          r_hat <- try(predict(fit, newdata = cur_X), silent = TRUE)
+          if (inherits(r_hat, "try-error") || is.na(r_hat)) next
+          N_pred <- N_pred * exp(r_hat)  # sequential forecast
+        }
+        
+        # Percent error
+        PE <- ((N_pred - N_true) / N_true) * 100
+        
+        if (!is.na(PE) && is.finite(PE)) {
+          errors_all <- c(errors_all, PE)
+        }
+      }
+    }
+    
+    if (length(errors_all) == 0) {
+      results <- rbind(results,
+                       data.frame(horizon = h, MAPE = NA, MALPE = NA))
+    } else {
+      results <- rbind(results,
+                       data.frame(horizon = h,
+                                  MAPE = mean(abs(errors_all)),
+                                  MALPE = mean(errors_all)))
+    }
+  }
+  
+  return(results)
+}
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+results_test <- compute_mape_malpe(
+  df          = world_pop_full_clean,
+  X           = X,
+  model_vars  = selected_vars,
+  horizons    = c(1,5,10),
+  window_size = 20
+)
+
+results_test
+```
+
+```{r, echo=FALSE, warning=FALSE}
+results_test
+```
+
+The rolling-window evaluation shows that the reduced model performs very well for short-term population growth forecasting. At a one-year horizon, the model achieves MAPE of 0.21%, indicating that predictions closely track actual year-to-year population changes.
+
+As the forecast horizon increases, prediction error grows. The five-year horizon produces a MAPE of 2.26% with modest positive bias. The ten-year horizon shows MAPE of about 6.14% and a MALPE of 2.08. Overall, the model demonstrates strong short-term accuracy and maintains stable long-run behavior, capturing global population growth patterns with relatively low error even up to a decade ahead.
+

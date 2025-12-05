@@ -1,0 +1,115 @@
+---
+title: "Data Processing"
+author: "Diana Aleksieieva"
+date: "2025-12-05"
+format:
+  html:
+    theme: cosmo
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries 
+
+
+```{r, echo=FALSE}
+library(tidyverse)
+library(countrycode)
+```
+
+## Data loading
+
+
+```{r pressure, echo=FALSE}
+# Function to read CSV and remove empty columns
+read_clean_csv <- function(file, skip = 0) {
+  read_csv(file, skip = skip, show_col_types = FALSE) %>%
+    select(where(~ !all(is.na(.))))
+}
+
+# ---- Load raw data ----
+population_raw <- read_clean_csv("data/population.csv", skip = 4)
+income         <- read_clean_csv("data/income.csv")
+pop_age        <- read_clean_csv("data/population_age.csv", skip = 4)
+net_mig        <- read_clean_csv("data/net_migration.csv", skip = 4)
+birth_data <- read_clean_csv("data/birth_rate.csv", skip = 4)
+death_data <- read_clean_csv("data/death_rate.csv", skip = 4)
+
+# ---- Valid country ISO3 codes ----
+valid_country_codes <- countrycode::codelist$iso3c %>% 
+  na.omit() %>% 
+  unique()
+
+# ---- Tidy population data ----
+world_pop <- population_raw %>%
+  rename(`Country or Territory` = `Country Name`) %>%
+  pivot_longer(
+    cols = matches("^[0-9]{4}$"),
+    names_to = "Year",
+    values_to = "Population"
+  ) %>%
+  mutate(
+    Year = as.numeric(Year),
+    Last5Years = Year >= 2019 & Year <= 2024
+  ) %>%
+  filter(`Country Code` %in% valid_country_codes) %>%
+  mutate(
+    Region = countrycode(`Country Code`, origin = "iso3c", destination = "region")
+  )
+
+# ---- Tidy data ----
+pop_age_long <- pop_age %>%
+  pivot_longer(
+    cols = matches("^[0-9]{4}$"),
+    names_to = "Year",
+    values_to = "Pop15_64_pct"
+  ) %>%
+  mutate(Year = as.numeric(Year))
+
+net_mig_long <- net_mig %>%
+  pivot_longer(
+    cols = matches("^[0-9]{4}$"),
+    names_to = "Year",
+    values_to = "NetMigration"
+  ) %>%
+  mutate(Year = as.numeric(Year))
+
+birth_long <- birth_data %>%
+  pivot_longer(
+    cols = matches("^[0-9]{4}$"),
+    names_to = "Year",
+    values_to = "BirthRate"
+  ) %>%
+  mutate(Year = as.numeric(Year))
+
+death_long <- death_data %>%
+  pivot_longer(
+    cols = matches("^[0-9]{4}$"),
+    names_to = "Year",
+    values_to = "DeathRate"
+  ) %>%
+  mutate(Year = as.numeric(Year))
+
+# ---- Merge into full dataset ----
+world_pop_full <- world_pop %>%
+  left_join(income %>% select(`Country Code`, IncomeGroup), 
+            by = "Country Code") %>%
+  left_join(pop_age_long %>% select(`Country Code`, Year, Pop15_64_pct),
+            by = c("Country Code", "Year")) %>%
+  left_join(net_mig_long %>% select(`Country Code`, Year, NetMigration),
+            by = c("Country Code", "Year")) %>%
+  left_join(birth_long %>% select(`Country Code`, Year, BirthRate),
+            by = c("Country Code", "Year")) %>%
+  left_join(death_long %>% select(`Country Code`, Year, DeathRate),
+            by = c("Country Code", "Year"))
+
+# ---- Ensure output directory exists ----
+dir.create("data/output", recursive = TRUE, showWarnings = FALSE)
+
+# ---- Export to CSV ----
+write_csv(world_pop_full, "data/output/world_population_full_clean.csv")
+```
+
